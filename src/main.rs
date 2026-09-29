@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, Write};
-use std::path::{PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command};
 
 #[derive(Debug, Parser)]
@@ -63,7 +63,7 @@ fn cache_dir() -> Result<PathBuf> {
 /// Rejected: empty, contains `/` or `\`, contains `..`, starts with `.` or `-`.
 fn validate_component(s :&str, field_name: &str) -> Result<()> {
     anyhow::ensure!(!s.is_empty(), "{field_name} cannot be empty.");
-    anyhow::ensure!(!s.contains(" "), "{field_name} cannot contain ' ' (empty space) ");
+    anyhow::ensure!(!s.contains(" "), "{field_name} cannot contain ' ' (empty space)");
     anyhow::ensure!(!s.contains("/"), "{field_name} cannot contain '/' (path separator) ");
     anyhow::ensure!(!s.contains("\\"), "{field_name} cannot contain '\\' (path separator) ");
     anyhow::ensure!(!s.contains(".."), "{field_name} cannot contain '..' (path traversal) ");
@@ -158,13 +158,16 @@ fn cmd_fetch (repo_url :String, name :String, version :String) -> Result<()>{
                 .context("failed to spawn `git` - is it installed and on your PATH")?;
 
     anyhow::ensure!(status.success(), "git clone exited with non-zero code");
+
+    std::fs::remove_dir_all(dest.join(".git"))
+    .context("failed to remove cloned repository's .git directory")?;
     
     println!("cached {name}@{version} -> {}", dest.display());
     
     Ok(())
 }
 
-fn cmd_use( name :String, version :String, link :bool) -> Result<()> {
+fn cmd_use(name :String, version :String, link :bool) -> Result<()> {
     validate_component(&name, "name")?;
     validate_component(&version, "version")?;
 
@@ -175,6 +178,7 @@ fn cmd_use( name :String, version :String, link :bool) -> Result<()> {
     );
 
     let lib_dir = PathBuf::from("lib");
+
     let dest = lib_dir.join(&name);
 
     std::fs::create_dir_all(&lib_dir)
@@ -186,8 +190,7 @@ fn cmd_use( name :String, version :String, link :bool) -> Result<()> {
         install_copy(&src, &dest)?;
     }
 
-    append_remapping(&name)?;
-
+    append_remapping(&name, &dest)?;
 
     println!("installed {name}@{version} into ./lib and updated remappings.txt");
 
@@ -209,6 +212,9 @@ fn cmd_list() -> Result<()> {
         .with_context(|| format!("failed to read cache directory {}", dir.display()))?
         {
             let entry = entry.context("failed to read cache directory entry")?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
             let lib_name = entry.file_name();
 
             let lib_name = lib_name.to_string_lossy();
@@ -248,6 +254,7 @@ fn cmd_remove (name :String, version :Option<String>) -> Result<()> {
 
     match version {
         Some(ver) => {
+
             validate_component(&ver, "version")?;
             let target = base.join(&ver);
 
@@ -314,7 +321,7 @@ fn cmd_remove (name :String, version :Option<String>) -> Result<()> {
 
 
 /// Prints Questions Followed by [Y/N], reads one line from stdin,
-/// Returns True only if the user typed y or Yes , it is case-insensitive.
+/// Returns True only if the user typed y or Yes or YES or yes or Y or yEs , it is not case-insensitive.
 /// Pressing Enter alone (empty input) is treated as **No**  (the safe default)
 
 fn confirm(question :&str) -> Result<bool> {
@@ -337,10 +344,10 @@ fn confirm(question :&str) -> Result<bool> {
 
 // Install Helpers
 
-/// Creates a symlink `dest` -> `src` . Unix-only.
+/// Creates a symlink  `src` ` ->  `dest . Unix-only.
 ///Returns an error (and does not continue) if the operation fails.
 #[cfg(unix)]
-fn install_symlink(src: &PathBuf, dest: &PathBuf) -> Result<()> {
+fn install_symlink(src: &Path, dest: &Path) -> Result<()> {
     if dest.exists() || dest.symlink_metadata().is_ok() {
         bail!(
             "destination {} already exists; remove first",
@@ -360,12 +367,12 @@ fn install_symlink(src: &PathBuf, dest: &PathBuf) -> Result<()> {
 
 /// Stub for non-Unix platforms: `--link` is not supported.
 #[cfg(not(unix))]
-fn install_symlink(_src: &PathBuf, _dest: &PathBuf) -> Result<()> {
+fn install_symlink(_src: &Path, _dest: &Path) -> Result<()> {
     bail!(" `--link` is only supported on Unix systems; omit the flag to copy instead")
 }
 
 /// Recursively copies src into dest.
-fn install_copy(src: &PathBuf, dest: &PathBuf) ->  Result<()> {
+fn install_copy(src: &Path, dest: &Path) ->  Result<()> {
     let mut opts = fs_extra::dir::CopyOptions::new();
     opts.copy_inside = true;
     fs_extra::dir::copy(src, dest, &opts)
@@ -375,11 +382,30 @@ fn install_copy(src: &PathBuf, dest: &PathBuf) ->  Result<()> {
     Ok(())
 }
 
+
+/// Detects the most likely Solidity source root inside a freshly installed
+/// library directory.
+///
+/// Check order (first match wins):
+///   1. `src/`       – forge-std, solmate, most modern libs
+///   2. `contracts/` – OpenZeppelin, ERC721A
+///   3. `""` (root)  – fallback: remapping points at the lib root itself
+fn detect_src_dir(lib_path: &Path) -> &'static str {
+    if lib_path.join("src").is_dir() {
+        return "src/";
+    }
+    if lib_path.join("contracts").is_dir() {
+        return "contracts/";
+    }
+    ""  // fallback: remap directly to lib root
+}
+
 /// Appends a remapping entry for a name to remappings.txt,
 /// **only if an identical line does not already exists**.
 
-fn append_remapping(name: &str) ->  Result<()> {
-    let remap_line = format!("{name}/=lib/{name}/contracts/");
+fn append_remapping(name: &str, lib_path: &Path) ->  Result<()> {
+    let src_dir = detect_src_dir(lib_path);
+    let remap_line = format!("{name}/=lib/{name}/{src_dir}");
     let path = PathBuf::from("remappings.txt");
 
     // Read existing lines (if file exists) and check for duplicates.
@@ -390,7 +416,7 @@ fn append_remapping(name: &str) ->  Result<()> {
 
         let already_present = std::io::BufReader::new(file)
             .lines()
-            .any(|l| l.map(|l| l.trim().to_owned() == remap_line).unwrap_or(false));
+            .any(|l| l.map(|l| l.trim() == remap_line).unwrap_or(false));
 
         if already_present {
             println!("  remappings.txt already contains '{remap_line}' -- skipped");
@@ -422,7 +448,6 @@ fn main() -> Result<()> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,43 +455,71 @@ mod tests {
     // ----Validate Component
 
     #[test]
-    fn rejects_path_traversal_dotdot() {
-        assert!(validate_component("../../etc", "name").is_err());
+    fn rejects_path_traversal() {
+        let result = validate_component(".../../etc", "name");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot contain '/' (path separator)"));
     }
 
     #[test]
-    fn rejects_dotdot_embedded() {
-        assert!(validate_component("a..b", "name").is_err());
+    fn rejects_traversal() {
+        let result = validate_component("a...b", "name");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot contain '..' (path traversal)"));
     }
     #[test]
     fn rejects_leading_dash_flag_injection() {
-        assert!(validate_component("--upload-pack=/bin/sh", "version").is_err());
+        let result = validate_component("--upload-pack", "version");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot starts with '-' (looks like CLI flag)"));
     }
+
     #[test]
     fn rejects_leading_dot() {
-        assert!(validate_component(".hidden", "name").is_err());
+        let result = validate_component(".hidden", "name");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot starts with '.' (hidden/relative path)"));
     }
     #[test]
     fn rejects_space() {
-        assert!(validate_component("open  book", "name").is_err());
+        let result = validate_component("open  book", "name");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot contain ' ' (empty space)"));
     }
 
     #[test]
     fn rejects_slash() {
-        assert!(validate_component("owner/repo", "name").is_err());
+        let result = validate_component("owner/repo", "name");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot contain '/' (path separator)"));
     }
     #[test]
     fn rejects_backlash() {
-        assert!(validate_component("dog\\cat", "name").is_err());
+        let result = validate_component("dog\\cat", "name");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot contain '\\' (path separator)"));
     }
     #[test]
     fn rejects_empty() {
-        assert!(validate_component("", "version").is_err());
+        let result = validate_component("", "version");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot be empty"));
     }
 
     #[test]
     fn rejects_invalid_char_at() {
-        assert!(validate_component("lib@v1", "name").is_err());
+        let result = validate_component("lib@v1", "name");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot contain invalid characters"));
     }
 
     #[test]
@@ -483,33 +536,59 @@ mod tests {
 
     #[test]
     fn rejects_plain_http() {
-        assert!(validate_repo_url("http://github.com/owner/repo").is_err());
+        let result = validate_repo_url("http://github.com/owner/repo");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("repo_url must be an HTTPS URL from github.com"));
     }
 
     #[test]
     fn rejects_url_with_space() {
-        assert!(validate_repo_url("https://github.com/   book").is_err());
+        let result = validate_repo_url("https://github.com/   book");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("repo_url must not contain  spaces"));
     }
 
     #[test]
     fn rejects_url_with_query_string() {
-    assert!(validate_repo_url("https://github.com/owner/repo?").is_err());
-
+        let result = validate_repo_url("https://github.com/owner/repo?");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("repo_url must not contain ('?')  a query string"));
     }
 
     #[test]
     fn rejects_url_with_fragment() {
-    assert!(validate_repo_url("https://github.com/owner/repo#readme").is_err());
+         let result = validate_repo_url("https://github.com/owner/repo#readme");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("repo_url  must not contain  ('#') a URL Fragment"));
     }
+    
 
     #[test]
     fn rejects_url_missing_repo_segment() {
-        assert!(validate_repo_url("https://github.com/owner").is_err());
+        let result = validate_repo_url("https://github.com/owner");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("repo_url must include an owner and a repository name"));
+    }
+   
+    #[test]
+    fn rejects_url_that_starts_with_hyphen() {
+        let result = validate_repo_url("-https://github.com/OpenZeppelin/openzeppelin-contracts");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("repo_url must not start with '-' "));
     }
 
     #[test]
     fn rejects_bare_github_root() {
-        assert!(validate_repo_url("https://github.com/").is_err());
+        let result = validate_repo_url("https://github.com/");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("repo_url must include an owner and a repository name"));
     }
 
     #[test]
@@ -522,4 +601,36 @@ mod tests {
         assert!(validate_repo_url("https://github.com/OpenZeppelin/openzeppelin-contracts/").is_ok());
     }
 
+     // --- detect_src_dir ---
+
+    fn temp_lib(label: &str, layout: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("forgelib-test-{label}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for sub in layout {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn src_dir_preferred_over_contracts() {
+        let dir = temp_lib("src-pref", &["src", "contracts"]);
+        assert_eq!(detect_src_dir(&dir), "src/");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn contracts_dir_used_when_no_src() {
+        let dir = temp_lib("contracts-only", &["contracts"]);
+        assert_eq!(detect_src_dir(&dir), "contracts/");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_known_layout_falls_back_to_root() {
+        let dir = temp_lib("root-fallback", &["lib"]);
+        assert_eq!(detect_src_dir(&dir), "");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
